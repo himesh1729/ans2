@@ -42,11 +42,17 @@ A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + 
 
 The 28BYJ-48 motor plugs into the ULN2003 board's 5-pin white connector.
 
-### Water Pump
+### Water Pump (MOSFET)
 
-| Signal | Pin | Notes |
-|--------|-----|-------|
-| Water pump | Pin 30 (TX LED) | Active LOW; replace with relay GPIO for real pump |
+| Connection | Wiring |
+|-----------|--------|
+| MOSFET Gate | Pin 16 (via 220Ω resistor) |
+| MOSFET Source | GND |
+| MOSFET Drain | Pump negative terminal |
+| Pump positive | 5V (external supply) |
+| Gate pull-down | 10kΩ resistor between Gate and GND |
+
+The MOSFET is **active HIGH** — `digitalWrite(pin, HIGH)` turns the pump on.
 
 ## Dependencies
 
@@ -127,12 +133,15 @@ The system uses a software clock based on `millis()`. The user sets the current 
 ### Memory Usage
 U8g2 page buffering mode is used (128 bytes per page) to fit within the Pro Micro's 2.5KB RAM. The sketch uses ~44% of dynamic memory.
 
-## Replacing TX LED with Real Water Pump
+## Available Pins
 
-To connect an actual pump relay, change the pin definition:
+| Pin | Status |
+|-----|--------|
+| A0 | Free |
+| A1 | Free |
+| A2 | Free |
+| A3 | Free |
+| 0 (TX) | Free (avoid if using Serial) |
+| 1 (RX) | Free (avoid if using Serial) |
 
-```cpp
-#define PUMP_LED <your_pump_relay_pin>
-```
-
-The output is **active LOW** — `digitalWrite(pin, LOW)` turns ON, `HIGH` turns OFF. If your relay module is active HIGH, invert the logic in `checkDispensing()` and `setup()`.
+Planned: HX711 load cell (A0, A1) for cup/dispense verification.

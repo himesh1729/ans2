@@ -10,6 +10,13 @@ display:
   interface: I2C
   address: 0x3C
 
+water_pump:
+  control: MOSFET
+  pin: 16
+  logic: active_high
+  gate_resistor: 220ohm
+  pulldown_resistor: 10kohm
+
 stepper:
   motor: 28BYJ-48
   driver: ULN2003

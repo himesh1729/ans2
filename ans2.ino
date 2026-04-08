@@ -7,7 +7,7 @@
  *   - 1.3" OLED display (SH1106, 128x64, I2C at 0x3C)
  *   - EC11 rotary encoder with push button
  *   - CON (confirm) and BAK (back) buttons on the module
- *   - Water pump relay (currently simulated by TX LED, pin 30)
+ *   - Water pump via MOSFET on pin 16
  *   - 28BYJ-48 stepper motor via ULN2003 driver (nut dispenser)
  *
  * Pin Mapping:
@@ -22,6 +22,7 @@
  *   IN2 (ULN2003) -> Pin 10
  *   IN3 (ULN2003) -> Pin 14
  *   IN4 (ULN2003) -> Pin 15
+ *   PUMP (MOSFET gate) -> Pin 16
  *
  * Button Roles:
  *   PSH  - Select/confirm in all menus; open menu from home screen
@@ -67,7 +68,7 @@ U8G2_SH1106_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #define CON 4   // Confirm button (re-arm schedule only)
 #define BAK 8   // Back button
 
-#define PUMP_LED 30  // TX LED = water pump output (active LOW)
+#define PUMP_PIN 16  // MOSFET gate for water pump (HIGH = on)
 
 // --- Stepper motor (28BYJ-48 via ULN2003) for nut dispenser ---
 #define IN1 9
@@ -299,9 +300,9 @@ void setup() {
   pinMode(CON, INPUT_PULLUP);
   pinMode(BAK, INPUT_PULLUP);
 
-  // Water pump output (active LOW — HIGH = off)
-  pinMode(PUMP_LED, OUTPUT);
-  digitalWrite(PUMP_LED, HIGH);
+  // Water pump MOSFET (active HIGH — LOW = off)
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
 
   // Stepper motor pins
   pinMode(IN1, OUTPUT);
@@ -351,13 +352,13 @@ void checkDispensing() {
       stopMotor();
       dispState = 2;
       dispStarted = millis();
-      digitalWrite(PUMP_LED, LOW);   // Turn on water pump
+      digitalWrite(PUMP_PIN, HIGH);  // Turn on water pump
     }
   }
 
   // Water duration elapsed -> done, wait for user acknowledgment
   if (dispState == 2 && millis() - dispStarted >= (unsigned long)sched.duration * 1000UL) {
-    digitalWrite(PUMP_LED, HIGH);  // Turn off water pump
+    digitalWrite(PUMP_PIN, LOW);   // Turn off water pump
     dispState = 3;
   }
 }
