@@ -1,0 +1,17 @@
+board:
+  name: Arduino Pro Micro
+  fqbn: arduino:avr:leonardo
+  core: arduino:avr@1.8.6
+
+display:
+  type: OLED 1.3"
+  driver: SH1106
+  resolution: 128x64
+  interface: I2C
+  address: 0x3C
+
+libraries:
+  - name: U8g2
+    version: "2.35.30"
+  - name: Wire
+    version: built-in
