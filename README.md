@@ -1,6 +1,6 @@
 # Automatic Nut & Water Dispensing System
 
-A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + EC11 rotary encoder module. At a user-configured time each day, the system dispenses nuts for a set duration, then immediately dispenses water for the same duration.
+A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + EC11 rotary encoder module. At a user-configured time each day, the system dispenses nuts via a stepper motor for a set duration, then immediately runs a water pump for the same duration.
 
 ## Hardware
 
@@ -10,9 +10,12 @@ A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + 
 | Display | 1.3" OLED, SH1106 driver, 128x64, I2C (0x3C) |
 | Encoder | EC11 rotary encoder with push button |
 | Buttons | CON (confirm) and BAK (back) on the module |
-| Outputs | Water pump relay + Nut dispenser motor relay (currently simulated by onboard TX/RX LEDs) |
+| Nut Dispenser | 28BYJ-48 stepper motor via ULN2003 driver board |
+| Water Pump | Relay module (currently simulated by onboard TX LED) |
 
 ## Wiring
+
+### OLED + Encoder Module
 
 | Module Pin | Pro Micro Pin | Function |
 |-----------|---------------|----------|
@@ -26,11 +29,24 @@ A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + 
 | CON | Pin 4 | Confirm button |
 | BAK | Pin 8 | Back button |
 
-**Output pins (accent LEDs for now):**
+### ULN2003 Stepper Driver (Nut Dispenser)
+
+| ULN2003 Pin | Pro Micro Pin |
+|-------------|---------------|
+| IN1 | Pin 9 |
+| IN2 | Pin 10 |
+| IN3 | Pin 14 |
+| IN4 | Pin 15 |
+| VCC | 5V (external supply recommended for motor current) |
+| GND | GND (shared with Pro Micro) |
+
+The 28BYJ-48 motor plugs into the ULN2003 board's 5-pin white connector.
+
+### Water Pump
+
 | Signal | Pin | Notes |
 |--------|-----|-------|
-| Nut dispenser | Pin 17 (RX LED) | Active LOW, replace with relay GPIO |
-| Water pump | Pin 30 (TX LED) | Active LOW, replace with relay GPIO |
+| Water pump | Pin 30 (TX LED) | Active LOW; replace with relay GPIO for real pump |
 
 ## Dependencies
 
@@ -49,7 +65,7 @@ Core: `arduino:avr` (Board: `arduino:avr:leonardo`)
 arduino-cli compile --fqbn arduino:avr:leonardo .
 
 # Upload (adjust port as needed)
-arduino-cli upload -p /dev/cu.usbmodem214401 --fqbn arduino:avr:leonardo .
+arduino-cli upload -p /dev/cu.usbmodem11101 --fqbn arduino:avr:leonardo .
 ```
 
 ## User Interface
@@ -88,25 +104,35 @@ arduino-cli upload -p /dev/cu.usbmodem214401 --fqbn arduino:avr:leonardo .
 
 When the clock reaches the scheduled time:
 
-1. **Nut dispenser** turns ON for the set duration
-2. **Water pump** turns ON for the same duration (immediately after nuts finish)
-3. Display shows **"Done! CON to restart"**
-4. Press **CON** to re-arm the schedule for the next trigger
+1. **Stepper motor** spins for the set duration (nut dispensing)
+2. Motor stops and coils are de-energized
+3. **Water pump** turns ON for the same duration (immediately after nuts finish)
+4. Display shows **"Done! CON to restart"**
+5. Press **CON** to re-arm the schedule for the next trigger
 
-## Time Keeping
+## Technical Notes
 
+### Stepper Motor
+- Uses full-step sequence (4 phases) for maximum torque
+- Step interval: 5ms between steps
+- Coils are de-energized when idle to save power and reduce heat
+- During dispensing, OLED redraws are throttled to once per second so the main loop stays fast enough to drive the stepper smoothly
+
+### Time Keeping
 The system uses a software clock based on `millis()`. The user sets the current time on boot. There is no RTC module, so:
 
 - Time resets on power loss (user must re-set)
 - Time may drift slightly over days (~1-2 seconds/day typical for a crystal oscillator)
 
-## Replacing LEDs with Real Hardware
+### Memory Usage
+U8g2 page buffering mode is used (128 bytes per page) to fit within the Pro Micro's 2.5KB RAM. The sketch uses ~44% of dynamic memory.
 
-To connect actual pump and motor relays, change the pin definitions and wiring:
+## Replacing TX LED with Real Water Pump
+
+To connect an actual pump relay, change the pin definition:
 
 ```cpp
 #define PUMP_LED <your_pump_relay_pin>
-#define NUT_LED  <your_nut_relay_pin>
 ```
 
-The outputs are **active LOW** — `digitalWrite(pin, LOW)` turns ON, `HIGH` turns OFF. If your relay module is active HIGH, invert the logic in `checkDispensing()` and `setup()`.
+The output is **active LOW** — `digitalWrite(pin, LOW)` turns ON, `HIGH` turns OFF. If your relay module is active HIGH, invert the logic in `checkDispensing()` and `setup()`.

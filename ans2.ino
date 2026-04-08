@@ -8,7 +8,7 @@
  *   - EC11 rotary encoder with push button
  *   - CON (confirm) and BAK (back) buttons on the module
  *   - Water pump relay (currently simulated by TX LED, pin 30)
- *   - Nut dispenser motor relay (currently simulated by RX LED, pin 17)
+ *   - 28BYJ-48 stepper motor via ULN2003 driver (nut dispenser)
  *
  * Pin Mapping:
  *   TRA (Encoder A) -> Pin 7  (interrupt-capable INT6)
@@ -18,6 +18,10 @@
  *   BAK (Back btn)    -> Pin 8
  *   SDA -> Pin 2 (I2C data)
  *   SCL -> Pin 3 (I2C clock)
+ *   IN1 (ULN2003) -> Pin 9
+ *   IN2 (ULN2003) -> Pin 10
+ *   IN3 (ULN2003) -> Pin 14
+ *   IN4 (ULN2003) -> Pin 15
  *
  * Button Roles:
  *   PSH  - Select/confirm in all menus; open menu from home screen
@@ -41,7 +45,13 @@
  *
  * Display Library:
  *   U8g2 with page buffering (128-byte pages) to fit within the
- *   Pro Micro's 2.5KB RAM.
+ *   Pro Micro's 2.5KB RAM. During stepper dispensing, display redraws
+ *   are throttled to once per second so the main loop runs fast enough
+ *   to step the motor at 5ms intervals.
+ *
+ * Stepper Motor:
+ *   28BYJ-48 driven via ULN2003 (full-step sequence, 5ms step delay).
+ *   Coils are de-energized when idle to save power and reduce heat.
  */
 
 #include <U8g2lib.h>
@@ -58,7 +68,37 @@ U8G2_SH1106_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #define BAK 8   // Back button
 
 #define PUMP_LED 30  // TX LED = water pump output (active LOW)
-#define NUT_LED 17   // RX LED = nut dispenser output (active LOW)
+
+// --- Stepper motor (28BYJ-48 via ULN2003) for nut dispenser ---
+#define IN1 9
+#define IN2 10
+#define IN3 14
+#define IN4 15
+
+// Full-step sequence (4 steps, good torque)
+const uint8_t stepSeq[4][4] = {
+  {1,1,0,0}, {0,1,1,0}, {0,0,1,1}, {1,0,0,1}
+};
+int stepIdx = 0;
+unsigned long lastStepTime = 0;
+#define STEP_DELAY_MS 5  // milliseconds between steps
+
+// Advance stepper one step (dir: 1=CW, -1=CCW). Non-blocking.
+void stepMotor(int dir) {
+  stepIdx = (stepIdx + dir + 4) % 4;
+  digitalWrite(IN1, stepSeq[stepIdx][0]);
+  digitalWrite(IN2, stepSeq[stepIdx][1]);
+  digitalWrite(IN3, stepSeq[stepIdx][2]);
+  digitalWrite(IN4, stepSeq[stepIdx][3]);
+}
+
+// Turn off all coils (saves power when idle)
+void stopMotor() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
 
 // =====================================================================
 // Rotary Encoder (interrupt-driven)
@@ -259,11 +299,16 @@ void setup() {
   pinMode(CON, INPUT_PULLUP);
   pinMode(BAK, INPUT_PULLUP);
 
-  // Output LEDs (active LOW — HIGH = off)
+  // Water pump output (active LOW — HIGH = off)
   pinMode(PUMP_LED, OUTPUT);
-  pinMode(NUT_LED, OUTPUT);
   digitalWrite(PUMP_LED, HIGH);
-  digitalWrite(NUT_LED, HIGH);
+
+  // Stepper motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotor();
 
   // Encoder interrupt on pin 7 (INT6)
   attachInterrupt(digitalPinToInterrupt(TRA), encoderISR, FALLING);
@@ -287,7 +332,6 @@ void checkDispensing() {
     if (curMin == schedMin && lastTriggerMin != curMin) {
       dispState = 1;
       dispStarted = millis();
-      digitalWrite(NUT_LED, LOW);  // Turn on nut dispenser
       lastTriggerMin = curMin;
     }
     // Reset trigger guard once we've moved past the scheduled minute
@@ -296,12 +340,19 @@ void checkDispensing() {
     }
   }
 
-  // Nuts duration elapsed -> switch to water pump
-  if (dispState == 1 && millis() - dispStarted >= (unsigned long)sched.duration * 1000UL) {
-    digitalWrite(NUT_LED, HIGH);   // Turn off nut dispenser
-    dispState = 2;
-    dispStarted = millis();
-    digitalWrite(PUMP_LED, LOW);   // Turn on water pump
+  // Nut dispenser running: step the motor non-blocking
+  if (dispState == 1) {
+    if (millis() - lastStepTime >= STEP_DELAY_MS) {
+      stepMotor(1);
+      lastStepTime = millis();
+    }
+    // Duration elapsed -> stop motor, switch to water pump
+    if (millis() - dispStarted >= (unsigned long)sched.duration * 1000UL) {
+      stopMotor();
+      dispState = 2;
+      dispStarted = millis();
+      digitalWrite(PUMP_LED, LOW);   // Turn on water pump
+    }
   }
 
   // Water duration elapsed -> done, wait for user acknowledgment
@@ -407,42 +458,52 @@ void loop() {
 
   checkDispensing();
 
-  // --- Render current screen ---
-  u8g2.firstPage();
-  do {
-    switch (screen) {
-      case CLOCK_HOUR:
-        snprintf(buf, sizeof(buf), "< %d h >", editVal);
-        drawValScreen("Set Clock", "Hour:", buf);
-        break;
-      case CLOCK_MIN:
-        snprintf(buf, sizeof(buf), "< %d m >", editVal);
-        drawValScreen("Set Clock", "Minute:", buf);
-        break;
-      case CLOCK_AMPM:
-        snprintf(buf, sizeof(buf), "< %s >", editPM ? "PM" : "AM");
-        drawValScreen("Set Clock", "AM / PM:", buf);
-        break;
-      case HOME:        drawHome(); break;
-      case MAIN_MENU:   drawMainMenu(); break;
-      case SCHED_HOUR:
-        snprintf(buf, sizeof(buf), "< %d h >", editVal);
-        drawValScreen("Set Schedule", "Hour:", buf);
-        break;
-      case SCHED_MIN:
-        snprintf(buf, sizeof(buf), "< %d m >", editVal);
-        drawValScreen("Set Schedule", "Minute:", buf);
-        break;
-      case SCHED_AMPM:
-        snprintf(buf, sizeof(buf), "< %s >", editPM ? "PM" : "AM");
-        drawValScreen("Set Schedule", "AM / PM:", buf);
-        break;
-      case SCHED_DUR:
-        snprintf(buf, sizeof(buf), "< %d s >", editVal);
-        drawValScreen("Set Schedule", "Duration:", buf);
-        break;
-    }
-  } while (u8g2.nextPage());
+  // --- During stepper dispensing, skip display redraws to keep loop fast ---
+  // Only redraw once per second while stepper is active
+  static unsigned long lastDraw = 0;
+  bool needDraw;
+  if (dispState == 1) {
+    needDraw = (millis() - lastDraw >= 1000);
+  } else {
+    needDraw = (millis() - lastDraw >= 50);
+  }
 
-  delay(50);
+  if (needDraw) {
+    lastDraw = millis();
+    u8g2.firstPage();
+    do {
+      switch (screen) {
+        case CLOCK_HOUR:
+          snprintf(buf, sizeof(buf), "< %d h >", editVal);
+          drawValScreen("Set Clock", "Hour:", buf);
+          break;
+        case CLOCK_MIN:
+          snprintf(buf, sizeof(buf), "< %d m >", editVal);
+          drawValScreen("Set Clock", "Minute:", buf);
+          break;
+        case CLOCK_AMPM:
+          snprintf(buf, sizeof(buf), "< %s >", editPM ? "PM" : "AM");
+          drawValScreen("Set Clock", "AM / PM:", buf);
+          break;
+        case HOME:        drawHome(); break;
+        case MAIN_MENU:   drawMainMenu(); break;
+        case SCHED_HOUR:
+          snprintf(buf, sizeof(buf), "< %d h >", editVal);
+          drawValScreen("Set Schedule", "Hour:", buf);
+          break;
+        case SCHED_MIN:
+          snprintf(buf, sizeof(buf), "< %d m >", editVal);
+          drawValScreen("Set Schedule", "Minute:", buf);
+          break;
+        case SCHED_AMPM:
+          snprintf(buf, sizeof(buf), "< %s >", editPM ? "PM" : "AM");
+          drawValScreen("Set Schedule", "AM / PM:", buf);
+          break;
+        case SCHED_DUR:
+          snprintf(buf, sizeof(buf), "< %d s >", editVal);
+          drawValScreen("Set Schedule", "Duration:", buf);
+          break;
+      }
+    } while (u8g2.nextPage());
+  }
 }

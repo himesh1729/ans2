@@ -10,6 +10,17 @@ display:
   interface: I2C
   address: 0x3C
 
+stepper:
+  motor: 28BYJ-48
+  driver: ULN2003
+  mode: full-step
+  step_delay_ms: 5
+  pins:
+    IN1: 9
+    IN2: 10
+    IN3: 14
+    IN4: 15
+
 libraries:
   - name: U8g2
     version: "2.35.30"
