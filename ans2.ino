@@ -7,8 +7,9 @@
  *   - 1.3" OLED display (SH1106, 128x64, I2C at 0x3C)
  *   - EC11 rotary encoder with push button
  *   - CON (confirm) and BAK (back) buttons on the module
- *   - Water pump via MOSFET on pin 16
+ *   - Water pump via MOSFET on pin 9
  *   - 28BYJ-48 stepper motor via ULN2003 driver (nut dispenser)
+ *   - DS3231 RTC module (I2C at 0x68)
  *
  * Pin Mapping:
  *   TRA (Encoder A) -> Pin 7  (interrupt-capable INT6)
@@ -18,11 +19,11 @@
  *   BAK (Back btn)    -> Pin 8
  *   SDA -> Pin 2 (I2C data)
  *   SCL -> Pin 3 (I2C clock)
- *   IN1 (ULN2003) -> Pin 9
- *   IN2 (ULN2003) -> Pin 10
+ *   IN1 (ULN2003) -> Pin 10
+ *   IN2 (ULN2003) -> Pin 16
  *   IN3 (ULN2003) -> Pin 14
  *   IN4 (ULN2003) -> Pin 15
- *   PUMP (MOSFET gate) -> Pin 16
+ *   PUMP (MOSFET gate) -> Pin 9
  *
  * Button Roles:
  *   PSH  - Select/confirm in all menus; open menu from home screen
@@ -41,8 +42,9 @@
  *   7. Schedule persists — no need to re-enter time/duration each day.
  *
  * Time Keeping:
- *   Uses millis()-based software clock, set by the user at boot.
- *   No RTC module — time resets on power loss and may drift over days.
+ *   DS3231 RTC module keeps accurate time with battery backup.
+ *   Time persists across power cycles. If RTC has valid time, clock
+ *   setup is skipped on boot.
  *
  * Display Library:
  *   U8g2 with page buffering (128-byte pages) to fit within the
@@ -57,9 +59,14 @@
 
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <RTClib.h>
+#include <EEPROM.h>
 
 // --- Display: SH1106 128x64 OLED over hardware I2C ---
 U8G2_SH1106_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// --- DS3231 RTC ---
+RTC_DS3231 rtc;
 
 // --- Pin definitions ---
 #define TRA 7   // Encoder channel A (uses INT6 for hardware interrupt)
@@ -68,11 +75,11 @@ U8G2_SH1106_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #define CON 4   // Confirm button (re-arm schedule only)
 #define BAK 8   // Back button
 
-#define PUMP_PIN 16  // MOSFET gate for water pump (HIGH = on)
+#define PUMP_PIN 9   // MOSFET gate for water pump (HIGH = on)
 
 // --- Stepper motor (28BYJ-48 via ULN2003) for nut dispenser ---
-#define IN1 9
-#define IN2 10
+#define IN1 10
+#define IN2 16
 #define IN3 14
 #define IN4 15
 
@@ -137,28 +144,25 @@ bool btnPressed(int pin, int &last) {
 int lastPsh = 1, lastCon = 1, lastBak = 1;
 
 // =====================================================================
-// Software Clock
+// RTC Time Functions
 // =====================================================================
-// Tracks time as seconds since midnight. User sets the initial time
-// at boot; millis() offset keeps it running. Wraps at 86400 (24h).
 
-unsigned long timeBaseMillis = 0;  // millis() snapshot when time was set
-long timeBaseSecs = 0;             // seconds since midnight at that snapshot
+DateTime now() { return rtc.now(); }
 
 // Current seconds since midnight
 long nowSecs() {
-  long elapsed = (millis() - timeBaseMillis) / 1000UL;
-  return (timeBaseSecs + elapsed) % 86400L;
+  DateTime n = now();
+  return (long)n.hour() * 3600L + (long)n.minute() * 60L + n.second();
 }
 
 // 12-hour format helpers
 int nowHour12() {
-  int h = (nowSecs() / 3600) % 12;
+  int h = now().hour() % 12;
   return h == 0 ? 12 : h;
 }
-int nowMin()    { return (nowSecs() / 60) % 60; }
-int nowSecond() { return nowSecs() % 60; }
-bool nowIsPM()  { return (nowSecs() / 3600) >= 12; }
+int nowMin()    { return now().minute(); }
+int nowSecond() { return now().second(); }
+bool nowIsPM()  { return now().hour() >= 12; }
 
 // Convert 12-hour + AM/PM to 24-hour format
 int to24(int h12, bool pm) {
@@ -173,11 +177,40 @@ int to24(int h12, bool pm) {
 struct Schedule {
   int hour24;         // scheduled hour in 24h format (0-23)
   uint8_t minute;     // scheduled minute (0-59)
-  uint8_t duration;   // dispense duration in seconds (1-120)
+  uint8_t nutDur;     // nut dispense duration in seconds (1-120)
+  uint8_t waterDur;   // water dispense duration in seconds (1-120)
   bool set;           // true once user has configured a schedule
 };
 
-Schedule sched = {0, 0, 10, false};
+Schedule sched = {0, 0, 10, 10, false};
+
+// EEPROM addresses for schedule persistence
+#define EEPROM_MAGIC_ADDR 0      // 1 byte: magic number to detect valid data
+#define EEPROM_HOUR_ADDR  1      // 1 byte: hour24 (0-23)
+#define EEPROM_MIN_ADDR   2      // 1 byte: minute (0-59)
+#define EEPROM_NUT_DUR_ADDR   3  // 1 byte: nut duration (1-120)
+#define EEPROM_WATER_DUR_ADDR 4  // 1 byte: water duration (1-120)
+#define EEPROM_MAGIC_VAL  0xA6   // Magic value (changed to invalidate old format)
+
+// Save schedule to EEPROM
+void saveSchedule() {
+  EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VAL);
+  EEPROM.update(EEPROM_HOUR_ADDR, (uint8_t)sched.hour24);
+  EEPROM.update(EEPROM_MIN_ADDR, sched.minute);
+  EEPROM.update(EEPROM_NUT_DUR_ADDR, sched.nutDur);
+  EEPROM.update(EEPROM_WATER_DUR_ADDR, sched.waterDur);
+}
+
+// Load schedule from EEPROM (returns true if valid data found)
+bool loadSchedule() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL) return false;
+  sched.hour24 = EEPROM.read(EEPROM_HOUR_ADDR);
+  sched.minute = EEPROM.read(EEPROM_MIN_ADDR);
+  sched.nutDur = EEPROM.read(EEPROM_NUT_DUR_ADDR);
+  sched.waterDur = EEPROM.read(EEPROM_WATER_DUR_ADDR);
+  sched.set = true;
+  return true;
+}
 
 // Dispense state machine:
 //   0 = idle (waiting for scheduled time)
@@ -199,7 +232,7 @@ enum Screen {
   CLOCK_HOUR, CLOCK_MIN, CLOCK_AMPM,   // Initial clock setup
   HOME,                                  // Home screen with time & status
   MAIN_MENU,                             // Menu: Set Schedule / Set Clock / Back
-  SCHED_HOUR, SCHED_MIN, SCHED_AMPM, SCHED_DUR  // Schedule setup wizard
+  SCHED_HOUR, SCHED_MIN, SCHED_AMPM, SCHED_NUT_DUR, SCHED_WATER_DUR  // Schedule setup wizard
 };
 
 Screen screen = CLOCK_HOUR;  // Boot into clock setup
@@ -208,6 +241,8 @@ int editVal = 12;            // Current value being edited by encoder
 bool editPM = false;         // AM/PM toggle state during editing
 int savedHour = 12;          // Stashed hour value across edit screens
 int savedMin = 0;            // Stashed minute value across edit screens
+int schedHour = 12;          // Stashed hour for schedule wizard
+int schedMin = 0;            // Stashed minute for schedule wizard
 
 // =====================================================================
 // Display Drawing Functions
@@ -248,8 +283,8 @@ void drawHome() {
     int sh = sched.hour24 % 12;
     if (sh == 0) sh = 12;
     bool spm = sched.hour24 >= 12;
-    snprintf(buf, sizeof(buf), "Sched: %02d:%02d %s %ds",
-             sh, sched.minute, spm ? "PM" : "AM", sched.duration);
+    snprintf(buf, sizeof(buf), "%02d:%02d%s N%ds W%ds",
+             sh, sched.minute, spm ? "P" : "A", sched.nutDur, sched.waterDur);
     u8g2.drawStr(4, 36, buf);
   } else {
     u8g2.drawStr(4, 36, "No schedule set");
@@ -315,6 +350,26 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(TRA), encoderISR, FALLING);
 
   u8g2.begin();
+
+  // Initialize RTC
+  if (!rtc.begin()) {
+    // RTC not found — show error and halt
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_ncenB10_tr);
+      u8g2.drawStr(10, 40, "RTC not found!");
+    } while (u8g2.nextPage());
+    while (1);  // halt
+  }
+
+  // Skip clock setup if RTC has valid time (battery maintained)
+  if (!rtc.lostPower()) {
+    screen = HOME;
+  }
+
+  // Load saved schedule from EEPROM
+  loadSchedule();
+
   editVal = 12;
   editPM = false;
 }
@@ -341,23 +396,21 @@ void checkDispensing() {
     }
   }
 
-  // Nut dispenser running: step the motor non-blocking
+  // Nut dispenser running: run motor continuously (blocking) for nutDur seconds
   if (dispState == 1) {
-    if (millis() - lastStepTime >= STEP_DELAY_MS) {
-      stepMotor(1);
-      lastStepTime = millis();
+    unsigned long endTime = dispStarted + (unsigned long)sched.nutDur * 1000UL;
+    while (millis() < endTime) {
+      stepMotor(-1);
+      delayMicroseconds(STEP_DELAY_MS * 1000UL);
     }
-    // Duration elapsed -> stop motor, switch to water pump
-    if (millis() - dispStarted >= (unsigned long)sched.duration * 1000UL) {
-      stopMotor();
-      dispState = 2;
-      dispStarted = millis();
-      digitalWrite(PUMP_PIN, HIGH);  // Turn on water pump
-    }
+    stopMotor();
+    dispState = 2;
+    dispStarted = millis();
+    digitalWrite(PUMP_PIN, HIGH);  // Turn on water pump
   }
 
   // Water duration elapsed -> done, wait for user acknowledgment
-  if (dispState == 2 && millis() - dispStarted >= (unsigned long)sched.duration * 1000UL) {
+  if (dispState == 2 && millis() - dispStarted >= (unsigned long)sched.waterDur * 1000UL) {
     digitalWrite(PUMP_PIN, LOW);   // Turn off water pump
     dispState = 3;
   }
@@ -392,10 +445,9 @@ void loop() {
     case CLOCK_AMPM:
       if (enc != 0) editPM = !editPM;
       if (psh) {
-        // Commit the user-set time to the software clock
+        // Commit the user-set time to the RTC
         int h24 = to24(savedHour, editPM);
-        timeBaseSecs = (long)h24 * 3600L + (long)savedMin * 60L;
-        timeBaseMillis = millis();
+        rtc.adjust(DateTime(2024, 1, 1, h24, savedMin, 0));
         screen = HOME;
       }
       if (bak) { editVal = savedMin; screen = CLOCK_MIN; }
@@ -423,51 +475,56 @@ void loop() {
     // --- Schedule setup wizard ---
     case SCHED_HOUR:
       editVal = constrain(editVal + enc, 1, 12);
-      if (psh) { savedHour = editVal; editVal = 0; screen = SCHED_MIN; }
+      if (psh) { schedHour = editVal; editVal = 0; screen = SCHED_MIN; }
       if (bak) screen = MAIN_MENU;
       break;
 
     case SCHED_MIN:
       editVal = constrain(editVal + enc, 0, 59);
-      if (psh) { savedMin = editVal; editPM = false; screen = SCHED_AMPM; }
-      if (bak) { editVal = savedHour; screen = SCHED_HOUR; }
+      if (psh) { schedMin = editVal; editPM = false; screen = SCHED_AMPM; }
+      if (bak) { editVal = schedHour; screen = SCHED_HOUR; }
       break;
 
     case SCHED_AMPM:
       if (enc != 0) editPM = !editPM;
       if (psh) {
-        sched.hour24 = to24(savedHour, editPM);
-        editVal = sched.duration;
-        screen = SCHED_DUR;
+        sched.hour24 = to24(schedHour, editPM);
+        editVal = sched.nutDur;
+        screen = SCHED_NUT_DUR;
       }
-      if (bak) { editVal = savedMin; screen = SCHED_MIN; }
+      if (bak) { editVal = schedMin; screen = SCHED_MIN; }
       break;
 
-    case SCHED_DUR:
+    case SCHED_NUT_DUR:
       editVal = constrain(editVal + enc, 1, 120);
       if (psh) {
-        sched.duration = editVal;
+        sched.nutDur = editVal;
+        editVal = sched.waterDur;
+        screen = SCHED_WATER_DUR;
+      }
+      if (bak) { screen = SCHED_AMPM; }
+      break;
+
+    case SCHED_WATER_DUR:
+      editVal = constrain(editVal + enc, 1, 120);
+      if (psh) {
+        sched.waterDur = editVal;
         sched.set = true;
-        sched.minute = savedMin;
+        sched.minute = schedMin;
+        saveSchedule();  // Persist to EEPROM
         dispState = 0;
         lastTriggerMin = -1;
         screen = HOME;
       }
-      if (bak) { screen = SCHED_AMPM; }
+      if (bak) { editVal = sched.nutDur; screen = SCHED_NUT_DUR; }
       break;
   }
 
   checkDispensing();
 
-  // --- During stepper dispensing, skip display redraws to keep loop fast ---
-  // Only redraw once per second while stepper is active
+  // Display refresh timing
   static unsigned long lastDraw = 0;
-  bool needDraw;
-  if (dispState == 1) {
-    needDraw = (millis() - lastDraw >= 1000);
-  } else {
-    needDraw = (millis() - lastDraw >= 50);
-  }
+  bool needDraw = (millis() - lastDraw >= 50);
 
   if (needDraw) {
     lastDraw = millis();
@@ -500,9 +557,13 @@ void loop() {
           snprintf(buf, sizeof(buf), "< %s >", editPM ? "PM" : "AM");
           drawValScreen("Set Schedule", "AM / PM:", buf);
           break;
-        case SCHED_DUR:
+        case SCHED_NUT_DUR:
           snprintf(buf, sizeof(buf), "< %d s >", editVal);
-          drawValScreen("Set Schedule", "Duration:", buf);
+          drawValScreen("Set Schedule", "Nuts:", buf);
+          break;
+        case SCHED_WATER_DUR:
+          snprintf(buf, sizeof(buf), "< %d s >", editVal);
+          drawValScreen("Set Schedule", "Water:", buf);
           break;
       }
     } while (u8g2.nextPage());

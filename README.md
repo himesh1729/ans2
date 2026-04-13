@@ -1,6 +1,6 @@
 # Automatic Nut & Water Dispensing System
 
-A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + EC11 rotary encoder module. At a user-configured time each day, the system dispenses nuts via a stepper motor for a set duration, then immediately runs a water pump for the same duration.
+A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + EC11 rotary encoder module. At a user-configured time each day, the system dispenses nuts via a stepper motor, then immediately runs a water pump. Each has its own configurable duration.
 
 ## Hardware
 
@@ -11,7 +11,8 @@ A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + 
 | Encoder | EC11 rotary encoder with push button |
 | Buttons | CON (confirm) and BAK (back) on the module |
 | Nut Dispenser | 28BYJ-48 stepper motor via ULN2003 driver board |
-| Water Pump | Relay module (currently simulated by onboard TX LED) |
+| Water Pump | MOSFET-controlled DC pump |
+| RTC | DS3231 module (I2C at 0x68) for accurate timekeeping |
 
 ## Wiring
 
@@ -21,20 +22,30 @@ A scheduled dispensing system built with an Arduino Pro Micro and a 1.3" OLED + 
 |-----------|---------------|----------|
 | VCC | VCC (5V) | Power |
 | GND | GND | Ground |
-| SDA | Pin 2 | I2C data (OLED) |
-| SCL | Pin 3 | I2C clock (OLED) |
+| SDA | Pin 2 | I2C data (OLED & RTC) |
+| SCL | Pin 3 | I2C clock (OLED & RTC) |
 | TRA | Pin 7 | Encoder channel A (INT6) |
 | TRB | Pin 5 | Encoder channel B |
 | PSH | Pin 6 | Encoder push button |
 | CON | Pin 4 | Confirm button |
 | BAK | Pin 8 | Back button |
 
+### DS3231 RTC Module
+
+| RTC Pin | Pro Micro Pin |
+|---------|---------------|
+| + (VCC) | VCC (5V) |
+| D (SDA) | Pin 2 |
+| C (SCL) | Pin 3 |
+| - (GND) | GND |
+| NC | Not connected |
+
 ### ULN2003 Stepper Driver (Nut Dispenser)
 
 | ULN2003 Pin | Pro Micro Pin |
 |-------------|---------------|
-| IN1 | Pin 9 |
-| IN2 | Pin 10 |
+| IN1 | Pin 10 |
+| IN2 | Pin 16 |
 | IN3 | Pin 14 |
 | IN4 | Pin 15 |
 | VCC | 5V (external supply recommended for motor current) |
@@ -46,7 +57,7 @@ The 28BYJ-48 motor plugs into the ULN2003 board's 5-pin white connector.
 
 | Connection | Wiring |
 |-----------|--------|
-| MOSFET Gate | Pin 16 (via 220Ω resistor) |
+| MOSFET Gate | Pin 9 (via 220Ω resistor) |
 | MOSFET Source | GND |
 | MOSFET Drain | Pump negative terminal |
 | Pump positive | 5V (external supply) |
@@ -59,7 +70,7 @@ The MOSFET is **active HIGH** — `digitalWrite(pin, HIGH)` turns the pump on.
 Install via Arduino CLI or Arduino IDE Library Manager:
 
 ```bash
-arduino-cli lib install "U8g2"
+arduino-cli lib install "U8g2" "RTClib"
 ```
 
 Core: `arduino:avr` (Board: `arduino:avr:leonardo`)
@@ -103,16 +114,16 @@ arduino-cli upload -p /dev/cu.usbmodem11101 --fqbn arduino:avr:leonardo .
    - Back — return to home
 
 4. **Set Schedule**
-   - Set hour (1-12) -> minute (0-59) -> AM/PM -> duration (1-120 seconds)
-   - Schedule persists until changed; no need to re-enter daily
+   - Set hour (1-12) -> minute (0-59) -> AM/PM -> nut duration (1-120s) -> water duration (1-120s)
+   - Schedule persists in EEPROM; no need to re-enter after power loss
 
 ### Dispensing Sequence
 
 When the clock reaches the scheduled time:
 
-1. **Stepper motor** spins for the set duration (nut dispensing)
+1. **Stepper motor** spins for the nut duration (nut dispensing)
 2. Motor stops and coils are de-energized
-3. **Water pump** turns ON for the same duration (immediately after nuts finish)
+3. **Water pump** turns ON for the water duration (immediately after nuts finish)
 4. Display shows **"Done! CON to restart"**
 5. Press **CON** to re-arm the schedule for the next trigger
 
@@ -122,16 +133,20 @@ When the clock reaches the scheduled time:
 - Uses full-step sequence (4 phases) for maximum torque
 - Step interval: 5ms between steps
 - Coils are de-energized when idle to save power and reduce heat
-- During dispensing, OLED redraws are throttled to once per second so the main loop stays fast enough to drive the stepper smoothly
+- During dispensing, stepper runs continuously (blocking) for smooth operation
 
 ### Time Keeping
-The system uses a software clock based on `millis()`. The user sets the current time on boot. There is no RTC module, so:
+The system uses a DS3231 RTC module for accurate timekeeping:
 
-- Time resets on power loss (user must re-set)
-- Time may drift slightly over days (~1-2 seconds/day typical for a crystal oscillator)
+- Time persists across power cycles (battery backup on RTC module)
+- Accuracy: ±2 ppm (~1 minute/year drift)
+- If RTC has valid time on boot, clock setup is skipped
+
+### Schedule Persistence
+Schedule is saved to EEPROM and restored on boot. Both time and durations persist across power cycles.
 
 ### Memory Usage
-U8g2 page buffering mode is used (128 bytes per page) to fit within the Pro Micro's 2.5KB RAM. The sketch uses ~44% of dynamic memory.
+U8g2 page buffering mode is used (128 bytes per page) to fit within the Pro Micro's 2.5KB RAM. The sketch uses ~45% of dynamic memory.
 
 ## Available Pins
 
