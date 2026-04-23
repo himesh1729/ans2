@@ -11,18 +11,22 @@
  *   - 28BYJ-48 stepper motor via ULN2003 driver (nut dispenser)
  *
  * Pin Mapping (Pico W):
- *   IN4 (ULN2003) -> GP2
- *   CON (Confirm btn) -> GP3
- *   SDA -> GP4 (I2C0 data)
- *   SCL -> GP5 (I2C0 clock)
- *   PSH (Encoder push) -> GP6
- *   TRA (Encoder A) -> GP7
- *   TRB (Encoder B) -> GP8
- *   BAK (Back btn) -> GP9
+ *   CON (Confirm btn) -> GP1
+ *   SDA (OLED) -> GP2 (I2C1 data)
+ *   SCL (OLED) -> GP3 (I2C1 clock)
+ *   PSH (Encoder push) -> GP4
+ *   TRA (Encoder A) -> GP5
+ *   TRB (Encoder B) -> GP6
+ *   BAK (Back btn) -> GP7
  *   IN1 (ULN2003) -> GP10
  *   IN2 (ULN2003) -> GP11
  *   IN3 (ULN2003) -> GP12
+ *   IN4 (ULN2003) -> GP13
  *   PUMP (MOSFET gate) -> GP14
+ *   SDA (RTC) -> GP16 (I2C0 data)
+ *   SCL (RTC) -> GP17 (I2C0 clock)
+ *   HX711 DOUT -> GP18
+ *   HX711 SCK -> GP19
  *
  * Advantages over Pro Micro version:
  *   - More RAM: Full framebuffer display mode possible
@@ -30,8 +34,8 @@
  *   - 3.3V logic: Works directly with most modern sensors
  *
  * Time Keeping:
- *   Manual clock setup on boot (like Pro Micro version).
- *   Time is kept using millis() and resets on power loss.
+ *   DS3231 RTC module on I2C0 (GP16/GP17) for accurate timekeeping.
+ *   Time persists across power cycles.
  *
  * Note: This is 3.3V logic. Ensure your MOSFET is logic-level
  *       compatible (e.g., IRLML6344) or use a gate driver.
@@ -40,17 +44,27 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <EEPROM.h>
+#include <RTClib.h>
+#include <HX711.h>
 
-// --- Display: SH1106 128x64 OLED over I2C0 (GP4=SDA, GP5=SCL) ---
+// --- RTC: DS3231 on I2C0 (GP16=SDA, GP17=SCL) ---
+RTC_DS3231 rtc;
+
+// --- HX711 Load Cell (GP18=DOUT, GP19=SCK) ---
+#define HX711_DOUT 18
+#define HX711_SCK  19
+HX711 scale;
+
+// --- Display: SH1106 128x64 OLED over I2C1 (GP2=SDA, GP3=SCL) ---
 // Using full buffer mode since Pico W has plenty of RAM (264KB vs 2.5KB)
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+U8G2_SH1106_128X64_NONAME_F_2ND_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 // --- Pin definitions (Pico W GPIO) ---
-#define CON 3   // Confirm button (re-arm schedule only)
-#define PSH 6   // Encoder push button (select/confirm)
-#define TRA 7   // Encoder channel A
-#define TRB 8   // Encoder channel B
-#define BAK 9   // Back button
+#define CON 1   // Confirm button (re-arm schedule only)
+#define PSH 4   // Encoder push button (select/confirm)
+#define TRA 5   // Encoder channel A
+#define TRB 6   // Encoder channel B
+#define BAK 7   // Back button
 
 #define PUMP_PIN 14  // MOSFET gate for water pump (HIGH = on)
 
@@ -58,7 +72,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #define IN1 10
 #define IN2 11
 #define IN3 12
-#define IN4 2
+#define IN4 13
 
 // Full-step sequence (4 steps, good torque)
 const uint8_t stepSeq[4][4] = {
@@ -128,31 +142,25 @@ bool btnPressed(int pin, int &last) {
 int lastPsh = 1, lastCon = 1, lastBak = 1;
 
 // =====================================================================
-// Time Functions (software clock using millis())
+// Time Functions (DS3231 RTC)
 // =====================================================================
-
-unsigned long timeBase = 0;  // millis() when time was set
-int hour24 = 12;
-int minute0 = 0;
 
 // Get current hour (24h format)
 int nowHour24() {
-  unsigned long elapsed = (millis() - timeBase) / 1000;
-  int totalMins = hour24 * 60 + minute0 + (elapsed / 60);
-  return (totalMins / 60) % 24;
+  DateTime now = rtc.now();
+  return now.hour();
 }
 
 // Get current minute
 int nowMin() {
-  unsigned long elapsed = (millis() - timeBase) / 1000;
-  int totalMins = hour24 * 60 + minute0 + (elapsed / 60);
-  return totalMins % 60;
+  DateTime now = rtc.now();
+  return now.minute();
 }
 
 // Get current second
 int nowSecond() {
-  unsigned long elapsed = (millis() - timeBase) / 1000;
-  return elapsed % 60;
+  DateTime now = rtc.now();
+  return now.second();
 }
 
 // Current seconds since midnight
@@ -176,11 +184,10 @@ int to24(int h12, bool pm) {
   else return h12 == 12 ? 0 : h12;
 }
 
-// Set time
+// Set time on RTC
 void setTime(int h24, int m) {
-  hour24 = h24;
-  minute0 = m;
-  timeBase = millis();
+  DateTime now = rtc.now();
+  rtc.adjust(DateTime(now.year(), now.month(), now.day(), h24, m, 0));
 }
 
 // =====================================================================
@@ -190,30 +197,45 @@ void setTime(int h24, int m) {
 struct Schedule {
   int hour24;         // scheduled hour in 24h format (0-23)
   uint8_t minute;     // scheduled minute (0-59)
-  uint8_t nutDur;     // nut dispense duration in seconds (1-120)
+  uint8_t nutGrams;   // nut dispense amount in grams (1-200)
   uint8_t waterDur;   // water dispense duration in seconds (1-120)
   bool set;           // true once user has configured a schedule
 };
 
-Schedule sched = {0, 0, 10, 10, false};
+Schedule sched = {0, 0, 50, 10, false};  // Default 50g nuts
 
-// EEPROM addresses for schedule persistence
+// HX711 calibration data
+float scaleCalibration = 1.0;  // Scale factor (raw units per gram)
+long scaleOffset = 0;          // Tare offset
+bool scaleCalibrated = false;
+#define KNOWN_WEIGHT_GRAMS 100  // Weight used for calibration (100g)
+
+// EEPROM addresses for persistence
 // Note: Pico W uses flash-emulated EEPROM
-#define EEPROM_MAGIC_ADDR 0      // 1 byte: magic number to detect valid data
-#define EEPROM_HOUR_ADDR  1      // 1 byte: hour24 (0-23)
-#define EEPROM_MIN_ADDR   2      // 1 byte: minute (0-59)
-#define EEPROM_NUT_DUR_ADDR   3  // 1 byte: nut duration (1-120)
-#define EEPROM_WATER_DUR_ADDR 4  // 1 byte: water duration (1-120)
-#define EEPROM_MAGIC_VAL  0xA7   // Magic value for Pico W version
+#define EEPROM_MAGIC_ADDR     0   // 1 byte: magic number
+#define EEPROM_HOUR_ADDR      1   // 1 byte: hour24 (0-23)
+#define EEPROM_MIN_ADDR       2   // 1 byte: minute (0-59)
+#define EEPROM_NUT_GRAMS_ADDR 3   // 1 byte: nut grams (1-200)
+#define EEPROM_WATER_DUR_ADDR 4   // 1 byte: water duration (1-120)
+#define EEPROM_SCALE_CAL_ADDR 5   // 4 bytes: scale calibration (float)
+#define EEPROM_SCALE_OFF_ADDR 9   // 4 bytes: scale offset (long)
+#define EEPROM_MAGIC_VAL      0xA8  // New magic value (changed due to new format)
 
 // Save schedule to EEPROM
 void saveSchedule() {
   EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VAL);
   EEPROM.write(EEPROM_HOUR_ADDR, (uint8_t)sched.hour24);
   EEPROM.write(EEPROM_MIN_ADDR, sched.minute);
-  EEPROM.write(EEPROM_NUT_DUR_ADDR, sched.nutDur);
+  EEPROM.write(EEPROM_NUT_GRAMS_ADDR, sched.nutGrams);
   EEPROM.write(EEPROM_WATER_DUR_ADDR, sched.waterDur);
-  EEPROM.commit();  // Required for Pico W flash-based EEPROM
+  EEPROM.commit();
+}
+
+// Save scale calibration to EEPROM
+void saveScaleCalibration() {
+  EEPROM.put(EEPROM_SCALE_CAL_ADDR, scaleCalibration);
+  EEPROM.put(EEPROM_SCALE_OFF_ADDR, scaleOffset);
+  EEPROM.commit();
 }
 
 // Load schedule from EEPROM (returns true if valid data found)
@@ -221,10 +243,31 @@ bool loadSchedule() {
   if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL) return false;
   sched.hour24 = EEPROM.read(EEPROM_HOUR_ADDR);
   sched.minute = EEPROM.read(EEPROM_MIN_ADDR);
-  sched.nutDur = EEPROM.read(EEPROM_NUT_DUR_ADDR);
+  sched.nutGrams = EEPROM.read(EEPROM_NUT_GRAMS_ADDR);
   sched.waterDur = EEPROM.read(EEPROM_WATER_DUR_ADDR);
   sched.set = true;
+  
+  // Load scale calibration
+  EEPROM.get(EEPROM_SCALE_CAL_ADDR, scaleCalibration);
+  EEPROM.get(EEPROM_SCALE_OFF_ADDR, scaleOffset);
+  if (scaleCalibration > 0.1 && scaleCalibration < 10000) {
+    scaleCalibrated = true;
+    scale.set_scale(scaleCalibration);
+    scale.set_offset(scaleOffset);
+  }
   return true;
+}
+
+// Get current weight in grams
+float getWeight() {
+  if (!scaleCalibrated) return 0;
+  return scale.get_units(3);  // Average of 3 readings
+}
+
+// Tare the scale (set current weight as zero)
+void tareScale() {
+  scale.tare(10);  // Average of 10 readings
+  scaleOffset = scale.get_offset();
 }
 
 // Dispense state machine:
@@ -246,9 +289,10 @@ void checkDispensing();
 enum Screen {
   CLOCK_HOUR, CLOCK_MIN, CLOCK_AMPM,     // Clock setup on boot
   HOME,                                   // Home screen with time & status
-  MAIN_MENU,                              // Menu: Set Schedule / Set Clock / Nuts / Water / Back
+  MAIN_MENU,                              // Menu: Set Schedule / Set Clock / Calibrate / Nuts / Water / Back
   INSTANT_NUTS, INSTANT_WATER,            // Instant dispense (hold PSH)
-  SCHED_HOUR, SCHED_MIN, SCHED_AMPM, SCHED_NUT_DUR, SCHED_WATER_DUR  // Schedule setup
+  SCHED_HOUR, SCHED_MIN, SCHED_AMPM, SCHED_NUT_GRAMS, SCHED_WATER_DUR,  // Schedule setup
+  CALIB_TARE, CALIB_PLACE, CALIB_DONE     // Scale calibration wizard
 };
 
 Screen screen = CLOCK_HOUR;  // Boot into clock setup
@@ -283,7 +327,7 @@ void drawValScreen(const char *title, const char *label, const char *valStr) {
 
 // Home screen: current time, schedule info, dispense status, button hints
 void drawHome() {
-  char buf[24];
+  char buf[32];
 
   // Current time (large, centered)
   u8g2.setFont(u8g2_font_ncenB12_tr);
@@ -300,22 +344,30 @@ void drawHome() {
     int sh = sched.hour24 % 12;
     if (sh == 0) sh = 12;
     bool spm = sched.hour24 >= 12;
-    snprintf(buf, sizeof(buf), "%02d:%02d%s N%ds W%ds",
-             sh, sched.minute, spm ? "P" : "A", sched.nutDur, sched.waterDur);
-    u8g2.drawStr(4, 36, buf);
+    snprintf(buf, sizeof(buf), "%02d:%02d%s N%dg W%ds",
+             sh, sched.minute, spm ? "P" : "A", sched.nutGrams, sched.waterDur);
+    u8g2.drawStr(4, 34, buf);
   } else {
-    u8g2.drawStr(4, 36, "No schedule set");
+    u8g2.drawStr(4, 34, "No schedule set");
+  }
+
+  // Current weight (if calibrated)
+  if (scaleCalibrated) {
+    snprintf(buf, sizeof(buf), "Weight: %.1fg", getWeight());
+    u8g2.drawStr(4, 44, buf);
   }
 
   // Dispense state
   if (dispState == 1)
-    u8g2.drawStr(4, 50, ">> Dispensing NUTS");
+    u8g2.drawStr(4, 54, ">> Dispensing NUTS");
   else if (dispState == 2)
-    u8g2.drawStr(4, 50, ">> Dispensing WATER");
+    u8g2.drawStr(4, 54, ">> Dispensing WATER");
   else if (dispState == 3)
-    u8g2.drawStr(4, 50, "Done! CON to restart");
+    u8g2.drawStr(4, 54, "Done! CON to restart");
+  else if (!scaleCalibrated)
+    u8g2.drawStr(4, 54, "Scale not calibrated");
   else
-    u8g2.drawStr(4, 50, "Idle");
+    u8g2.drawStr(4, 54, "Idle");
 
   // Button hints
   u8g2.drawStr(4, 64, "PSH:menu  CON:restart");
@@ -325,9 +377,9 @@ void drawHome() {
 void drawMainMenu() {
   drawTitle("Menu");
   u8g2.setFont(u8g2_font_6x10_tr);
-  const char *items[] = {"Set Schedule", "Set Clock", "Nuts", "Water", "Back"};
-  for (int i = 0; i < 5; i++) {
-    int y = 26 + i * 9;
+  const char *items[] = {"Schedule", "Clock", "Calibrate", "Nuts", "Water", "Back"};
+  for (int i = 0; i < 6; i++) {
+    int y = 24 + i * 8;
     if (i == menuPos) {
       // Inverted highlight for selected item
       u8g2.drawBox(0, y - 7, 128, 9);
@@ -344,14 +396,33 @@ void drawMainMenu() {
 // Setup
 // =====================================================================
 
+bool rtcOK = false;
+
 void setup() {
   // Initialize EEPROM (Pico W requires explicit size)
-  EEPROM.begin(16);  // 16 bytes is plenty for our data
+  EEPROM.begin(32);  // Increased for scale calibration data
 
-  // Configure I2C pins for Pico W (GP4=SDA, GP5=SCL)
-  Wire.setSDA(4);
-  Wire.setSCL(5);
+  // Configure I2C0 for RTC (GP16=SDA, GP17=SCL)
+  Wire.setSDA(16);
+  Wire.setSCL(17);
   Wire.begin();
+
+  // Configure I2C1 for OLED (GP2=SDA, GP3=SCL)
+  Wire1.setSDA(2);
+  Wire1.setSCL(3);
+  Wire1.begin();
+
+  // Initialize RTC
+  if (rtc.begin(&Wire)) {
+    rtcOK = true;
+    if (rtc.lostPower()) {
+      // RTC lost power, set to compile time as fallback
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+  }
+
+  // Initialize HX711 load cell
+  scale.begin(HX711_DOUT, HX711_SCK);
 
   // Configure button pins with internal pull-ups
   pinMode(TRA, INPUT_PULLUP);
@@ -379,8 +450,13 @@ void setup() {
   // Load saved schedule from EEPROM
   loadSchedule();
 
-  editVal = 12;
-  editPM = false;
+  // Skip clock setup if RTC has valid time
+  if (rtcOK && !rtc.lostPower()) {
+    screen = HOME;
+  } else {
+    editVal = 12;
+    editPM = false;
+  }
 }
 
 // =====================================================================
@@ -405,17 +481,33 @@ void checkDispensing() {
     }
   }
 
-  // Nut dispenser running: run motor continuously (blocking) for nutDur seconds
+  // Nut dispenser running: dispense until target weight reached
   if (dispState == 1) {
     // Show "Dispensing NUTS" before blocking
     u8g2.clearBuffer();
     drawHome();
     u8g2.sendBuffer();
     
-    unsigned long endTime = dispStarted + (unsigned long)sched.nutDur * 1000UL;
-    while (millis() < endTime) {
-      stepMotor(-1);
-      delayMicroseconds(STEP_DELAY_MS * 1000UL);
+    float targetWeight = (float)sched.nutGrams;
+    float startWeight = scaleCalibrated ? getWeight() : 0;
+    unsigned long timeout = millis() + 60000UL;  // 60 second timeout
+    
+    if (scaleCalibrated) {
+      // Weight-based dispensing
+      while (millis() < timeout) {
+        float currentWeight = getWeight();
+        if (currentWeight - startWeight >= targetWeight) break;
+        stepMotor(-1);
+        delayMicroseconds(STEP_DELAY_MS * 1000UL);
+      }
+    } else {
+      // Fallback: time-based (10 seconds per 50g estimate)
+      unsigned long duration = (unsigned long)sched.nutGrams * 200UL;  // ~200ms per gram
+      unsigned long endTime = millis() + duration;
+      while (millis() < endTime) {
+        stepMotor(-1);
+        delayMicroseconds(STEP_DELAY_MS * 1000UL);
+      }
     }
     stopMotor();
     dispState = 2;
@@ -477,15 +569,45 @@ void loop() {
 
     // --- Main menu ---
     case MAIN_MENU:
-      menuPos = constrain(menuPos + enc, 0, 4);
+      menuPos = constrain(menuPos + enc, 0, 5);
       if (psh) {
         if (menuPos == 0)      { screen = SCHED_HOUR; editVal = 12; editPM = false; }
         else if (menuPos == 1) { screen = CLOCK_HOUR; editVal = 12; editPM = false; }
-        else if (menuPos == 2) { screen = INSTANT_NUTS; }
-        else if (menuPos == 3) { screen = INSTANT_WATER; }
+        else if (menuPos == 2) { screen = CALIB_TARE; }
+        else if (menuPos == 3) { screen = INSTANT_NUTS; }
+        else if (menuPos == 4) { screen = INSTANT_WATER; }
         else                   { screen = HOME; }
       }
       if (bak) screen = HOME;
+      break;
+
+    // --- Calibration wizard ---
+    case CALIB_TARE:
+      // User should remove all weight, press PSH to tare
+      if (psh) {
+        tareScale();
+        screen = CALIB_PLACE;
+      }
+      if (bak) screen = MAIN_MENU;
+      break;
+
+    case CALIB_PLACE:
+      // User places known weight (100g), press PSH to calibrate
+      if (psh) {
+        long rawValue = scale.get_units(10);  // Average of 10 readings (raw after tare)
+        if (rawValue != 0) {
+          scaleCalibration = (float)rawValue / KNOWN_WEIGHT_GRAMS;
+          scale.set_scale(scaleCalibration);
+          scaleCalibrated = true;
+          saveScaleCalibration();
+        }
+        screen = CALIB_DONE;
+      }
+      if (bak) screen = CALIB_TARE;
+      break;
+
+    case CALIB_DONE:
+      if (psh || bak) screen = HOME;
       break;
 
     // --- Instant dispense modes (hold PSH to dispense) ---
@@ -523,16 +645,16 @@ void loop() {
       if (enc != 0) editPM = !editPM;
       if (psh) {
         sched.hour24 = to24(schedHour, editPM);
-        editVal = sched.nutDur;
-        screen = SCHED_NUT_DUR;
+        editVal = sched.nutGrams;
+        screen = SCHED_NUT_GRAMS;
       }
       if (bak) { editVal = schedMin; screen = SCHED_MIN; }
       break;
 
-    case SCHED_NUT_DUR:
-      editVal = constrain(editVal + enc, 1, 120);
+    case SCHED_NUT_GRAMS:
+      editVal = constrain(editVal + enc * 5, 5, 200);  // 5g increments, 5-200g
       if (psh) {
-        sched.nutDur = editVal;
+        sched.nutGrams = editVal;
         editVal = sched.waterDur;
         screen = SCHED_WATER_DUR;
       }
@@ -550,7 +672,7 @@ void loop() {
         lastTriggerMin = -1;
         screen = HOME;
       }
-      if (bak) { editVal = sched.nutDur; screen = SCHED_NUT_DUR; }
+      if (bak) { editVal = sched.nutGrams; screen = SCHED_NUT_GRAMS; }
       break;
   }
 
@@ -586,25 +708,35 @@ void loop() {
       case INSTANT_WATER:
         drawValScreen("Manual", "Hold PSH for", "WATER");
         break;
+      case CALIB_TARE:
+        drawValScreen("Calibrate", "Remove weight", "Press PSH");
+        break;
+      case CALIB_PLACE:
+        snprintf(buf, sizeof(buf), "Place %dg", KNOWN_WEIGHT_GRAMS);
+        drawValScreen("Calibrate", buf, "Press PSH");
+        break;
+      case CALIB_DONE:
+        drawValScreen("Calibrate", "Done!", "Press PSH");
+        break;
       case SCHED_HOUR:
         snprintf(buf, sizeof(buf), "< %d h >", editVal);
-        drawValScreen("Set Schedule", "Hour:", buf);
+        drawValScreen("Schedule", "Hour:", buf);
         break;
       case SCHED_MIN:
         snprintf(buf, sizeof(buf), "< %d m >", editVal);
-        drawValScreen("Set Schedule", "Minute:", buf);
+        drawValScreen("Schedule", "Minute:", buf);
         break;
       case SCHED_AMPM:
         snprintf(buf, sizeof(buf), "< %s >", editPM ? "PM" : "AM");
-        drawValScreen("Set Schedule", "AM / PM:", buf);
+        drawValScreen("Schedule", "AM / PM:", buf);
         break;
-      case SCHED_NUT_DUR:
-        snprintf(buf, sizeof(buf), "< %d s >", editVal);
-        drawValScreen("Set Schedule", "Nuts:", buf);
+      case SCHED_NUT_GRAMS:
+        snprintf(buf, sizeof(buf), "< %d g >", editVal);
+        drawValScreen("Schedule", "Nuts:", buf);
         break;
       case SCHED_WATER_DUR:
         snprintf(buf, sizeof(buf), "< %d s >", editVal);
-        drawValScreen("Set Schedule", "Water:", buf);
+        drawValScreen("Schedule", "Water:", buf);
         break;
     }
     u8g2.sendBuffer();

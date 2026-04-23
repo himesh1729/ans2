@@ -20,9 +20,9 @@
  *   SDA -> Pin 2 (I2C data)
  *   SCL -> Pin 3 (I2C clock)
  *   IN1 (ULN2003) -> Pin 10
- *   IN2 (ULN2003) -> Pin 16
- *   IN3 (ULN2003) -> Pin 14
- *   IN4 (ULN2003) -> Pin 15
+ *   IN2 (ULN2003) -> Pin 11
+ *   IN3 (ULN2003) -> Pin 12
+ *   IN4 (ULN2003) -> Pin 13
  *   PUMP (MOSFET gate) -> Pin 9
  *
  * Button Roles:
@@ -79,9 +79,9 @@ RTC_DS3231 rtc;
 
 // --- Stepper motor (28BYJ-48 via ULN2003) for nut dispenser ---
 #define IN1 10
-#define IN2 16
-#define IN3 14
-#define IN4 15
+#define IN2 11
+#define IN3 12
+#define IN4 13
 
 // Full-step sequence (4 steps, good torque)
 const uint8_t stepSeq[4][4] = {
