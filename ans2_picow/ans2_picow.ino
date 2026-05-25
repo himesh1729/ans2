@@ -23,10 +23,10 @@
  *   IN3 (ULN2003) -> GP12
  *   IN4 (ULN2003) -> GP13
  *   PUMP (MOSFET gate) -> GP14
- *   SDA (RTC) -> GP16 (I2C0 data)
- *   SCL (RTC) -> GP17 (I2C0 clock)
- *   HX711 DOUT -> GP18
- *   HX711 SCK -> GP19
+ *   HX711 DOUT -> GP16
+ *   HX711 SCK -> GP17
+ *   SDA (RTC) -> GP20 (I2C0 data)
+ *   SCL (RTC) -> GP21 (I2C0 clock)
  *
  * Advantages over Pro Micro version:
  *   - More RAM: Full framebuffer display mode possible
@@ -34,7 +34,7 @@
  *   - 3.3V logic: Works directly with most modern sensors
  *
  * Time Keeping:
- *   DS3231 RTC module on I2C0 (GP16/GP17) for accurate timekeeping.
+ *   DS3231 RTC module on I2C0 (GP20/GP21) for accurate timekeeping.
  *   Time persists across power cycles.
  *
  * Note: This is 3.3V logic. Ensure your MOSFET is logic-level
@@ -47,12 +47,12 @@
 #include <RTClib.h>
 #include <HX711.h>
 
-// --- RTC: DS3231 on I2C0 (GP16=SDA, GP17=SCL) ---
+// --- RTC: DS3231 on I2C0 (GP20=SDA, GP21=SCL) ---
 RTC_DS3231 rtc;
 
-// --- HX711 Load Cell (GP18=DOUT, GP19=SCK) ---
-#define HX711_DOUT 18
-#define HX711_SCK  19
+// --- HX711 Load Cell (GP16=DOUT, GP17=SCK) ---
+#define HX711_DOUT 16
+#define HX711_SCK  17
 HX711 scale;
 
 // --- Display: SH1106 128x64 OLED over I2C1 (GP2=SDA, GP3=SCL) ---
@@ -402,9 +402,9 @@ void setup() {
   // Initialize EEPROM (Pico W requires explicit size)
   EEPROM.begin(32);  // Increased for scale calibration data
 
-  // Configure I2C0 for RTC (GP16=SDA, GP17=SCL)
-  Wire.setSDA(16);
-  Wire.setSCL(17);
+  // Configure I2C0 for RTC (GP20=SDA, GP21=SCL)
+  Wire.setSDA(20);
+  Wire.setSCL(21);
   Wire.begin();
 
   // Configure I2C1 for OLED (GP2=SDA, GP3=SCL)
